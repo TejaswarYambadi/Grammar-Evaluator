@@ -7,11 +7,118 @@ import os
 import tempfile
 from audio_recorder_streamlit import audio_recorder
 import re
+import psycopg2
+from datetime import datetime
+import json
+from textblob import TextBlob
+import textstat
 
 st.set_page_config(page_title="Grammar Evaluator", page_icon="🎤", layout="wide")
 
 st.title("🎤 Voice-Based Grammar Evaluator")
 st.markdown("Evaluate your English grammar from voice inputs with AI-powered feedback")
+
+def get_db_connection():
+    """Get database connection"""
+    return psycopg2.connect(os.environ['DATABASE_URL'])
+
+def save_session_to_db(text, score, errors, input_method):
+    """Save analysis session to database"""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        
+        word_count = len(text.split())
+        error_count = len(errors)
+        
+        cur.execute(
+            """INSERT INTO grammar_sessions 
+               (transcribed_text, grammar_score, word_count, error_count, input_method) 
+               VALUES (%s, %s, %s, %s, %s) RETURNING id""",
+            (text, score, word_count, error_count, input_method)
+        )
+        session_id = cur.fetchone()[0]
+        
+        for error in errors:
+            suggestions_json = json.dumps(error['suggestions'])
+            cur.execute(
+                """INSERT INTO grammar_errors 
+                   (session_id, error_message, error_context, error_category, rule_id, suggestions) 
+                   VALUES (%s, %s, %s, %s, %s, %s)""",
+                (session_id, error['message'], error['context'], error['category'], 
+                 error['rule'], suggestions_json)
+            )
+        
+        conn.commit()
+        cur.close()
+        conn.close()
+        return True
+    except Exception as e:
+        st.error(f"Error saving to database: {str(e)}")
+        return False
+
+def get_user_history():
+    """Retrieve user's analysis history"""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        
+        cur.execute(
+            """SELECT id, session_date, transcribed_text, grammar_score, 
+                      word_count, error_count, input_method 
+               FROM grammar_sessions 
+               ORDER BY session_date DESC 
+               LIMIT 20"""
+        )
+        
+        sessions = []
+        for row in cur.fetchall():
+            sessions.append({
+                'id': row[0],
+                'date': row[1],
+                'text': row[2],
+                'score': row[3],
+                'word_count': row[4],
+                'error_count': row[5],
+                'input_method': row[6]
+            })
+        
+        cur.close()
+        conn.close()
+        return sessions
+    except Exception as e:
+        st.error(f"Error fetching history: {str(e)}")
+        return []
+
+def get_session_errors(session_id):
+    """Get errors for a specific session"""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        
+        cur.execute(
+            """SELECT error_message, error_context, error_category, rule_id, suggestions 
+               FROM grammar_errors 
+               WHERE session_id = %s""",
+            (session_id,)
+        )
+        
+        errors = []
+        for row in cur.fetchall():
+            errors.append({
+                'message': row[0],
+                'context': row[1],
+                'category': row[2],
+                'rule': row[3],
+                'suggestions': json.loads(row[4]) if row[4] else []
+            })
+        
+        cur.close()
+        conn.close()
+        return errors
+    except Exception as e:
+        st.error(f"Error fetching session errors: {str(e)}")
+        return []
 
 @st.cache_resource
 def load_grammar_tool():
@@ -53,6 +160,78 @@ def analyze_grammar(text):
         errors.append(error)
     
     return errors
+
+def analyze_style_and_tone(text):
+    """Analyze style and tone using advanced NLP"""
+    if not text or len(text.strip()) == 0:
+        return None
+    
+    blob = TextBlob(text)
+    
+    # Sentiment analysis
+    sentiment = blob.sentiment
+    sentiment_label = "Neutral"
+    if sentiment.polarity > 0.1:
+        sentiment_label = "Positive"
+    elif sentiment.polarity < -0.1:
+        sentiment_label = "Negative"
+    
+    # Readability metrics
+    reading_ease = textstat.flesch_reading_ease(text)
+    reading_grade = textstat.flesch_kincaid_grade(text)
+    
+    # Readability interpretation
+    if reading_ease >= 90:
+        reading_level = "Very Easy"
+    elif reading_ease >= 80:
+        reading_level = "Easy"
+    elif reading_ease >= 70:
+        reading_level = "Fairly Easy"
+    elif reading_ease >= 60:
+        reading_level = "Standard"
+    elif reading_ease >= 50:
+        reading_level = "Fairly Difficult"
+    elif reading_ease >= 30:
+        reading_level = "Difficult"
+    else:
+        reading_level = "Very Difficult"
+    
+    # Formality analysis (heuristic-based)
+    words = text.lower().split()
+    informal_words = ['gonna', 'wanna', 'gotta', 'yeah', 'yep', 'nope', 'ok', 'okay', 
+                      'kinda', 'sorta', 'dunno', 'ain\'t', 'y\'all', 'cause']
+    formal_indicators = ['therefore', 'furthermore', 'consequently', 'nevertheless', 
+                        'moreover', 'thus', 'hence', 'accordingly']
+    
+    informal_count = sum(1 for w in words if w in informal_words)
+    formal_count = sum(1 for w in words if w in formal_indicators)
+    
+    if formal_count > informal_count:
+        formality = "Formal"
+    elif informal_count > formal_count:
+        formality = "Informal"
+    else:
+        formality = "Neutral"
+    
+    # Word complexity
+    avg_word_length = sum(len(w) for w in text.split()) / len(text.split()) if text.split() else 0
+    
+    # Passive voice detection (simple heuristic)
+    passive_indicators = ['was', 'were', 'been', 'being', 'is', 'are', 'am']
+    passive_count = sum(1 for word in words if word in passive_indicators)
+    passive_percentage = (passive_count / len(words) * 100) if words else 0
+    
+    return {
+        'sentiment_label': sentiment_label,
+        'sentiment_polarity': round(sentiment.polarity, 2),
+        'sentiment_subjectivity': round(sentiment.subjectivity, 2),
+        'reading_ease': round(reading_ease, 1),
+        'reading_level': reading_level,
+        'reading_grade': round(reading_grade, 1),
+        'formality': formality,
+        'avg_word_length': round(avg_word_length, 1),
+        'passive_voice_percentage': round(passive_percentage, 1)
+    }
 
 def extract_linguistic_features(text, errors):
     """Extract linguistic features for ML model"""
@@ -137,7 +316,7 @@ def get_score_color(score):
     else:
         return "red"
 
-def display_grammar_feedback(text, errors, score):
+def display_grammar_feedback(text, errors, score, style_analysis=None):
     """Display grammar analysis results"""
     
     # Display score with color
@@ -155,6 +334,45 @@ def display_grammar_feedback(text, errors, score):
     # Display transcribed text
     st.subheader("📝 Transcribed Text")
     st.text_area("Your Speech", text, height=150, disabled=True)
+    
+    # Display style and tone analysis
+    if style_analysis:
+        st.subheader("🎨 Style & Tone Analysis")
+        
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("Sentiment", style_analysis['sentiment_label'])
+            st.caption(f"Polarity: {style_analysis['sentiment_polarity']}")
+        
+        with col2:
+            st.metric("Formality", style_analysis['formality'])
+            st.caption(f"Avg Word Length: {style_analysis['avg_word_length']}")
+        
+        with col3:
+            st.metric("Reading Level", style_analysis['reading_level'])
+            st.caption(f"Grade: {style_analysis['reading_grade']}")
+        
+        with col4:
+            st.metric("Reading Ease", f"{style_analysis['reading_ease']}")
+            st.caption(f"Passive Voice: {style_analysis['passive_voice_percentage']}%")
+        
+        # Additional insights
+        with st.expander("📖 Detailed Style Insights"):
+            st.write(f"**Sentiment Polarity:** {style_analysis['sentiment_polarity']} (-1 to 1, where -1 is very negative and 1 is very positive)")
+            st.write(f"**Sentiment Subjectivity:** {style_analysis['sentiment_subjectivity']} (0 to 1, where 0 is objective and 1 is subjective)")
+            st.write(f"**Flesch Reading Ease:** {style_analysis['reading_ease']} (Higher scores indicate easier readability)")
+            st.write(f"**Flesch-Kincaid Grade:** {style_analysis['reading_grade']} (U.S. school grade level)")
+            st.write(f"**Average Word Length:** {style_analysis['avg_word_length']} characters")
+            st.write(f"**Passive Voice Usage:** {style_analysis['passive_voice_percentage']}% (Lower is generally better)")
+            
+            # Recommendations
+            st.markdown("**Recommendations:**")
+            if style_analysis['passive_voice_percentage'] > 20:
+                st.info("Consider reducing passive voice usage for more direct and engaging writing.")
+            if style_analysis['reading_ease'] < 60:
+                st.info("Your text is fairly difficult to read. Consider using shorter sentences and simpler words.")
+            if style_analysis['avg_word_length'] > 6:
+                st.info("Try using shorter, more common words to improve clarity.")
     
     # Display errors and suggestions
     if errors:
@@ -192,99 +410,169 @@ def save_audio_file(audio_bytes):
 # Main app layout
 st.markdown("---")
 
-# Input method selection
-input_method = st.radio(
-    "Choose input method:",
-    ["🎙️ Record Audio", "📁 Upload Audio File"],
-    horizontal=True
-)
+# Create tabs for different views
+tab1, tab2 = st.tabs(["🎤 Analyze Grammar", "📊 History & Progress"])
 
-if input_method == "🎙️ Record Audio":
-    st.info("Click the microphone button below to start recording. Speak clearly in English.")
-    
-    audio_bytes = audio_recorder(
-        text="Click to record",
-        recording_color="#e74c3c",
-        neutral_color="#3498db",
-        icon_name="microphone",
-        icon_size="3x"
+with tab1:
+    # Input method selection
+    input_method = st.radio(
+        "Choose input method:",
+        ["🎙️ Record Audio", "📁 Upload Audio File"],
+        horizontal=True
     )
-    
-    if audio_bytes:
-        st.audio(audio_bytes, format="audio/wav")
-        
-        if st.button("🔍 Analyze Grammar", type="primary"):
-            with st.spinner("Processing audio and analyzing grammar..."):
-                # Save audio to temporary file
-                audio_file_path = save_audio_file(audio_bytes)
-                
-                try:
-                    # Transcribe audio
-                    text, error = transcribe_audio(audio_file_path)
-                    
-                    if error:
-                        st.error(error)
-                    elif text:
-                        # Analyze grammar
-                        errors = analyze_grammar(text)
-                        score = calculate_grammar_score(text, errors)
-                        
-                        # Display results
-                        st.markdown("---")
-                        display_grammar_feedback(text, errors, score)
-                    
-                finally:
-                    # Clean up temporary file
-                    if os.path.exists(audio_file_path):
-                        os.remove(audio_file_path)
 
-else:  # Upload Audio File
-    st.info("Upload an audio file (WAV, MP3, FLAC, etc.) with English speech.")
-    
-    uploaded_file = st.file_uploader(
-        "Choose an audio file",
-        type=['wav', 'mp3', 'flac', 'ogg', 'm4a'],
-        help="Supported formats: WAV, MP3, FLAC, OGG, M4A"
-    )
-    
-    if uploaded_file:
-        st.audio(uploaded_file)
+    if input_method == "🎙️ Record Audio":
+        st.info("Click the microphone button below to start recording. Speak clearly in English.")
         
-        if st.button("🔍 Analyze Grammar", type="primary"):
-            with st.spinner("Processing audio and analyzing grammar..."):
-                # Save uploaded file to temporary location
-                with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(uploaded_file.name)[1]) as tmp_file:
-                    tmp_file.write(uploaded_file.read())
-                    uploaded_file_path = tmp_file.name
-                
-                try:
-                    # Convert to WAV if needed
-                    if not uploaded_file_path.endswith('.wav'):
-                        from pydub import AudioSegment
-                        audio = AudioSegment.from_file(uploaded_file_path)
-                        wav_path = uploaded_file_path.replace(os.path.splitext(uploaded_file_path)[1], '.wav')
-                        audio.export(wav_path, format='wav')
-                        os.remove(uploaded_file_path)
-                        uploaded_file_path = wav_path
+        audio_bytes = audio_recorder(
+            text="Click to record",
+            recording_color="#e74c3c",
+            neutral_color="#3498db",
+            icon_name="microphone",
+            icon_size="3x"
+        )
+        
+        if audio_bytes:
+            st.audio(audio_bytes, format="audio/wav")
+            
+            if st.button("🔍 Analyze Grammar", type="primary"):
+                with st.spinner("Processing audio and analyzing grammar..."):
+                    # Save audio to temporary file
+                    audio_file_path = save_audio_file(audio_bytes)
                     
-                    # Transcribe audio
-                    text, error = transcribe_audio(uploaded_file_path)
-                    
-                    if error:
-                        st.error(error)
-                    elif text:
-                        # Analyze grammar
-                        errors = analyze_grammar(text)
-                        score = calculate_grammar_score(text, errors)
+                    try:
+                        # Transcribe audio
+                        text, error = transcribe_audio(audio_file_path)
                         
-                        # Display results
-                        st.markdown("---")
-                        display_grammar_feedback(text, errors, score)
+                        if error:
+                            st.error(error)
+                        elif text:
+                            # Analyze grammar
+                            errors = analyze_grammar(text)
+                            score = calculate_grammar_score(text, errors)
+                            
+                            # Analyze style and tone
+                            style_analysis = analyze_style_and_tone(text)
+                            
+                            # Save to database
+                            save_session_to_db(text, score, errors, "Record Audio")
+                            
+                            # Display results
+                            st.markdown("---")
+                            display_grammar_feedback(text, errors, score, style_analysis)
+                        
+                    finally:
+                        # Clean up temporary file
+                        if os.path.exists(audio_file_path):
+                            os.remove(audio_file_path)
+
+    else:  # Upload Audio File
+        st.info("Upload an audio file (WAV, MP3, FLAC, etc.) with English speech.")
+        
+        uploaded_file = st.file_uploader(
+            "Choose an audio file",
+            type=['wav', 'mp3', 'flac', 'ogg', 'm4a'],
+            help="Supported formats: WAV, MP3, FLAC, OGG, M4A"
+        )
+        
+        if uploaded_file:
+            st.audio(uploaded_file)
+            
+            if st.button("🔍 Analyze Grammar", type="primary"):
+                with st.spinner("Processing audio and analyzing grammar..."):
+                    # Save uploaded file to temporary location
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(uploaded_file.name)[1]) as tmp_file:
+                        tmp_file.write(uploaded_file.read())
+                        uploaded_file_path = tmp_file.name
+                    
+                    try:
+                        # Convert to WAV if needed
+                        if not uploaded_file_path.endswith('.wav'):
+                            from pydub import AudioSegment
+                            audio = AudioSegment.from_file(uploaded_file_path)
+                            wav_path = uploaded_file_path.replace(os.path.splitext(uploaded_file_path)[1], '.wav')
+                            audio.export(wav_path, format='wav')
+                            os.remove(uploaded_file_path)
+                            uploaded_file_path = wav_path
+                        
+                        # Transcribe audio
+                        text, error = transcribe_audio(uploaded_file_path)
+                        
+                        if error:
+                            st.error(error)
+                        elif text:
+                            # Analyze grammar
+                            errors = analyze_grammar(text)
+                            score = calculate_grammar_score(text, errors)
+                            
+                            # Analyze style and tone
+                            style_analysis = analyze_style_and_tone(text)
+                            
+                            # Save to database
+                            save_session_to_db(text, score, errors, "Upload Audio File")
+                            
+                            # Display results
+                            st.markdown("---")
+                            display_grammar_feedback(text, errors, score, style_analysis)
+                    
+                    finally:
+                        # Clean up temporary file
+                        if os.path.exists(uploaded_file_path):
+                            os.remove(uploaded_file_path)
+
+with tab2:
+    st.header("📊 Your Grammar Progress History")
+    st.markdown("Track your grammar improvement over time with detailed session history.")
+    
+    sessions = get_user_history()
+    
+    if sessions:
+        # Display summary statistics
+        avg_score = sum(s['score'] for s in sessions) / len(sessions)
+        total_words = sum(s['word_count'] for s in sessions)
+        total_errors = sum(s['error_count'] for s in sessions)
+        
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("Total Sessions", len(sessions))
+        with col2:
+            st.metric("Average Score", f"{avg_score:.1f}/10")
+        with col3:
+            st.metric("Total Words Analyzed", total_words)
+        with col4:
+            st.metric("Total Errors Found", total_errors)
+        
+        st.markdown("---")
+        st.subheader("Recent Sessions")
+        
+        # Display each session
+        for session in sessions:
+            with st.expander(
+                f"📅 {session['date'].strftime('%Y-%m-%d %H:%M')} - Score: {session['score']}/10 | "
+                f"Errors: {session['error_count']} | Words: {session['word_count']}"
+            ):
+                st.write(f"**Input Method:** {session['input_method']}")
+                st.write(f"**Transcribed Text:**")
+                st.text_area(
+                    "Text",
+                    session['text'],
+                    height=100,
+                    disabled=True,
+                    key=f"text_{session['id']}"
+                )
                 
-                finally:
-                    # Clean up temporary file
-                    if os.path.exists(uploaded_file_path):
-                        os.remove(uploaded_file_path)
+                # Show errors for this session
+                session_errors = get_session_errors(session['id'])
+                if session_errors:
+                    st.write(f"**Grammar Errors ({len(session_errors)}):**")
+                    for idx, error in enumerate(session_errors, 1):
+                        st.markdown(f"**{idx}.** {error['category']} - {error['message']}")
+                        if error['suggestions']:
+                            st.markdown(f"   *Suggestions:* {', '.join(error['suggestions'])}")
+                else:
+                    st.success("No errors in this session!")
+    else:
+        st.info("No analysis history yet. Start by analyzing some audio in the 'Analyze Grammar' tab!")
 
 # Sidebar with information
 with st.sidebar:
