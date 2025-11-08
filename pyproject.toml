@@ -4,5 +4,14 @@ version = "0.1.0"
 description = "Add your description here"
 requires-python = ">=3.11"
 dependencies = [
+    "audio-recorder-streamlit>=0.0.10",
+    "language-tool-python>=2.9.5",
+    "librosa>=0.11.0",
+    "numpy>=2.3.4",
+    "pyaudio>=0.2.14",
+    "pydub>=0.25.1",
+    "scikit-learn>=1.7.2",
+    "soundfile>=0.13.1",
+    "speechrecognition>=3.14.3",
     "streamlit>=1.51.0",
 ]
