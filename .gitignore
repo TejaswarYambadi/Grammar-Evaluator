@@ -1,0 +1,40 @@
+# Environment variables (keep private)
+.env
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Virtual environment
+venv/
+env/
+ENV/
+
+# Temporary files
+*.tmp
+*.temp
+temp/
+
+# Database files
+*.db
+*.sqlite3
+
+# Audio files
+*.wav
+*.mp3
+*.flac
+*.ogg
+*.m4a
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db

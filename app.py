@@ -1,126 +1,242 @@
 import streamlit as st
 import speech_recognition as sr
 import language_tool_python
-import numpy as np
-from sklearn.ensemble import RandomForestRegressor
 import os
 import tempfile
 from audio_recorder_streamlit import audio_recorder
-import re
-import psycopg2
-from datetime import datetime
 import json
-from textblob import TextBlob
-import textstat
+import psycopg2
+from dotenv import load_dotenv
+import google.generativeai as genai
+import warnings
+
+# Suppress warnings
+warnings.filterwarnings('ignore')
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+os.environ['GRPC_VERBOSITY'] = 'ERROR'
+os.environ['GLOG_minloglevel'] = '2'
+
+load_dotenv()
+
+# Configure Gemini API
+genai.configure(api_key=os.getenv('GEMINI_API_KEY'))
 
 st.set_page_config(page_title="Grammar Evaluator", page_icon="🎤", layout="wide")
 
-st.title("🎤 Voice-Based Grammar Evaluator")
-st.markdown("Evaluate your English grammar from voice inputs with AI-powered feedback")
+# Header with word meaning finder
+col1, col2 = st.columns([5, 1])
+with col1:
+    st.title("🎤 Voice-Based Grammar Evaluator")
+    st.markdown("Evaluate your English grammar from voice inputs with AI-powered feedback")
+with col2:
+    st.markdown("")
+    if st.button("📖 Word Meaning", type="secondary", key="word_finder_btn"):
+        st.session_state.show_word_finder = not st.session_state.get('show_word_finder', False)
 
+@st.cache_resource(ttl=300)
 def get_db_connection():
-    """Get database connection"""
-    return psycopg2.connect(os.environ['DATABASE_URL'])
+    """Get PostgreSQL database connection"""
+    try:
+        # Try DATABASE_URL first, then individual parameters
+        database_url = os.getenv('DATABASE_URL')
+        if database_url:
+            conn = psycopg2.connect(database_url)
+        else:
+            conn = psycopg2.connect(
+                host=os.getenv('DB_HOST', 'localhost'),
+                database=os.getenv('DB_NAME', 'voicegrammar'),
+                user=os.getenv('DB_USER', 'postgres'),
+                password=os.getenv('DB_PASSWORD'),
+                port=os.getenv('DB_PORT', '5432')
+            )
+        
+        cursor = conn.cursor()
+        
+        # Create grammar_sessions table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS grammar_sessions (
+                id SERIAL PRIMARY KEY,
+                text TEXT NOT NULL,
+                score REAL NOT NULL CHECK (score >= 0 AND score <= 10),
+                errors INTEGER NOT NULL DEFAULT 0,
+                method VARCHAR(50) NOT NULL,
+                date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        # Create grammar_errors table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS grammar_errors (
+                id SERIAL PRIMARY KEY,
+                session_id INTEGER NOT NULL REFERENCES grammar_sessions(id) ON DELETE CASCADE,
+                error_message TEXT NOT NULL,
+                error_context TEXT,
+                error_category VARCHAR(100),
+                rule_id VARCHAR(100),
+                suggestions JSONB,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        # Create user_stats table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS user_stats (
+                id SERIAL PRIMARY KEY,
+                total_sessions INTEGER DEFAULT 0,
+                total_words INTEGER DEFAULT 0,
+                total_errors INTEGER DEFAULT 0,
+                average_score REAL DEFAULT 0,
+                best_score REAL DEFAULT 0,
+                last_session_date TIMESTAMP,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        # Create indexes
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_grammar_sessions_date ON grammar_sessions(date DESC)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_grammar_errors_session_id ON grammar_errors(session_id)')
+        
+        # Insert initial user stats if not exists
+        cursor.execute('INSERT INTO user_stats (id) VALUES (1) ON CONFLICT (id) DO NOTHING')
+        
+        conn.commit()
+        return conn
+    except Exception as e:
+        st.error(f"Database connection failed: {str(e)}")
+        return None
 
 def save_session_to_db(text, score, errors, input_method):
-    """Save analysis session to database"""
+    """Save session to PostgreSQL database with detailed error tracking"""
     try:
         conn = get_db_connection()
+        if not conn:
+            return False
         cur = conn.cursor()
         
-        word_count = len(text.split())
-        error_count = len(errors)
-        
+        # Insert session record
         cur.execute(
-            """INSERT INTO grammar_sessions 
-               (transcribed_text, grammar_score, word_count, error_count, input_method) 
-               VALUES (%s, %s, %s, %s, %s) RETURNING id""",
-            (text, score, word_count, error_count, input_method)
+            "INSERT INTO grammar_sessions (text, score, errors, method) VALUES (%s, %s, %s, %s) RETURNING id",
+            (text or '', float(score), len(errors) if errors else 0, input_method or '')
         )
         session_id = cur.fetchone()[0]
         
-        for error in errors:
-            suggestions_json = json.dumps(error['suggestions'])
-            cur.execute(
-                """INSERT INTO grammar_errors 
-                   (session_id, error_message, error_context, error_category, rule_id, suggestions) 
-                   VALUES (%s, %s, %s, %s, %s, %s)""",
-                (session_id, error['message'], error['context'], error['category'], 
-                 error['rule'], suggestions_json)
-            )
+        # Insert detailed errors if any
+        if errors and session_id:
+            for error in errors:
+                cur.execute(
+                    """INSERT INTO grammar_errors 
+                       (session_id, error_message, error_context, error_category, rule_id, suggestions) 
+                       VALUES (%s, %s, %s, %s, %s, %s)""",
+                    (session_id,
+                     error.get('message', ''),
+                     error.get('context', ''),
+                     error.get('category', ''),
+                     error.get('rule', ''),
+                     json.dumps(error.get('suggestions', [])))
+                )
+        
+        # Update user statistics
+        word_count = len(text.split()) if text else 0
+        cur.execute(
+            """UPDATE user_stats SET 
+               total_sessions = total_sessions + 1,
+               total_words = total_words + %s,
+               total_errors = total_errors + %s,
+               average_score = (SELECT AVG(score) FROM grammar_sessions),
+               best_score = GREATEST(best_score, %s),
+               last_session_date = CURRENT_TIMESTAMP
+               WHERE id = 1""",
+            (word_count, len(errors) if errors else 0, float(score))
+        )
         
         conn.commit()
         cur.close()
-        conn.close()
         return True
     except Exception as e:
         st.error(f"Error saving to database: {str(e)}")
         return False
 
 def get_user_history():
-    """Retrieve user's analysis history"""
+    """Get recent sessions with detailed information"""
     try:
         conn = get_db_connection()
+        if not conn:
+            return []
         cur = conn.cursor()
-        
         cur.execute(
-            """SELECT id, session_date, transcribed_text, grammar_score, 
-                      word_count, error_count, input_method 
+            """SELECT id, text, score, errors, method, date 
                FROM grammar_sessions 
-               ORDER BY session_date DESC 
-               LIMIT 20"""
+               ORDER BY date DESC LIMIT 10"""
         )
-        
-        sessions = []
-        for row in cur.fetchall():
-            sessions.append({
-                'id': row[0],
-                'date': row[1],
-                'text': row[2],
-                'score': row[3],
-                'word_count': row[4],
-                'error_count': row[5],
-                'input_method': row[6]
-            })
-        
+        result = [{
+            'id': r[0], 'text': r[1], 'score': r[2], 
+            'errors': r[3], 'method': r[4], 'date': r[5]
+        } for r in cur.fetchall()]
         cur.close()
-        conn.close()
-        return sessions
+        return result
     except Exception as e:
         st.error(f"Error fetching history: {str(e)}")
         return []
 
-def get_session_errors(session_id):
-    """Get errors for a specific session"""
+def get_user_stats():
+    """Get user statistics from database"""
     try:
         conn = get_db_connection()
+        if not conn:
+            return None
         cur = conn.cursor()
-        
         cur.execute(
-            """SELECT error_message, error_context, error_category, rule_id, suggestions 
+            """SELECT total_sessions, total_words, total_errors, 
+                      average_score, best_score, last_session_date 
+               FROM user_stats WHERE id = 1"""
+        )
+        row = cur.fetchone()
+        if row:
+            return {
+                'total_sessions': row[0],
+                'total_words': row[1],
+                'total_errors': row[2],
+                'average_score': round(row[3], 1) if row[3] else 0,
+                'best_score': row[4] if row[4] else 0,
+                'last_session_date': row[5]
+            }
+        cur.close()
+        return None
+    except Exception as e:
+        st.error(f"Error fetching stats: {str(e)}")
+        return None
+
+def get_session_errors(session_id):
+    """Get detailed errors for a specific session"""
+    try:
+        conn = get_db_connection()
+        if not conn:
+            return []
+        cur = conn.cursor()
+        cur.execute(
+            """SELECT error_message, error_context, error_category, 
+                      rule_id, suggestions 
                FROM grammar_errors 
                WHERE session_id = %s""",
             (session_id,)
         )
-        
-        errors = []
-        for row in cur.fetchall():
-            errors.append({
-                'message': row[0],
-                'context': row[1],
-                'category': row[2],
-                'rule': row[3],
-                'suggestions': json.loads(row[4]) if row[4] else []
-            })
-        
+        result = [{
+            'message': r[0],
+            'context': r[1],
+            'category': r[2],
+            'rule': r[3],
+            'suggestions': json.loads(r[4]) if r[4] else []
+        } for r in cur.fetchall()]
         cur.close()
-        conn.close()
-        return errors
+        return result
     except Exception as e:
         st.error(f"Error fetching session errors: {str(e)}")
         return []
 
-@st.cache_resource
+
+
+@st.cache_resource(ttl=600)
 def load_grammar_tool():
     """Load LanguageTool for grammar checking"""
     return language_tool_python.LanguageTool('en-US')
@@ -142,168 +258,62 @@ def transcribe_audio(audio_file_path):
         return None, f"Error processing audio: {str(e)}"
 
 def analyze_grammar(text):
-    """Analyze grammar using LanguageTool"""
+    """Analyze grammar using LanguageTool - Grammar mistakes only"""
     tool = load_grammar_tool()
     matches = tool.check(text)
     
+    # Filter only grammar-related errors
+    grammar_categories = ['GRAMMAR', 'MORFOLOGIK_RULE', 'TYPOS', 'PUNCTUATION']
+    
     errors = []
     for match in matches:
-        error = {
-            'message': match.message,
-            'context': match.context,
-            'offset': match.offset,
-            'error_length': match.errorLength,
-            'suggestions': match.replacements[:3] if match.replacements else [],
-            'rule': match.ruleId,
-            'category': match.category
-        }
-        errors.append(error)
+        # Only include grammar-related errors
+        if any(cat in match.category.upper() for cat in grammar_categories):
+            error = {
+                'message': match.message,
+                'context': match.context,
+                'offset': match.offset,
+                'error_length': match.errorLength,
+                'suggestions': match.replacements[:3] if match.replacements else [],
+                'rule': match.ruleId,
+                'category': match.category
+            }
+            errors.append(error)
     
     return errors
 
-def analyze_style_and_tone(text):
-    """Analyze style and tone using advanced NLP"""
-    if not text or len(text.strip()) == 0:
-        return None
-    
-    blob = TextBlob(text)
-    
-    # Sentiment analysis
-    sentiment = blob.sentiment
-    sentiment_label = "Neutral"
-    if sentiment.polarity > 0.1:
-        sentiment_label = "Positive"
-    elif sentiment.polarity < -0.1:
-        sentiment_label = "Negative"
-    
-    # Readability metrics
-    reading_ease = textstat.flesch_reading_ease(text)
-    reading_grade = textstat.flesch_kincaid_grade(text)
-    
-    # Readability interpretation
-    if reading_ease >= 90:
-        reading_level = "Very Easy"
-    elif reading_ease >= 80:
-        reading_level = "Easy"
-    elif reading_ease >= 70:
-        reading_level = "Fairly Easy"
-    elif reading_ease >= 60:
-        reading_level = "Standard"
-    elif reading_ease >= 50:
-        reading_level = "Fairly Difficult"
-    elif reading_ease >= 30:
-        reading_level = "Difficult"
-    else:
-        reading_level = "Very Difficult"
-    
-    # Formality analysis (heuristic-based)
-    words = text.lower().split()
-    informal_words = ['gonna', 'wanna', 'gotta', 'yeah', 'yep', 'nope', 'ok', 'okay', 
-                      'kinda', 'sorta', 'dunno', 'ain\'t', 'y\'all', 'cause']
-    formal_indicators = ['therefore', 'furthermore', 'consequently', 'nevertheless', 
-                        'moreover', 'thus', 'hence', 'accordingly']
-    
-    informal_count = sum(1 for w in words if w in informal_words)
-    formal_count = sum(1 for w in words if w in formal_indicators)
-    
-    if formal_count > informal_count:
-        formality = "Formal"
-    elif informal_count > formal_count:
-        formality = "Informal"
-    else:
-        formality = "Neutral"
-    
-    # Word complexity
-    avg_word_length = sum(len(w) for w in text.split()) / len(text.split()) if text.split() else 0
-    
-    # Passive voice detection (simple heuristic)
-    passive_indicators = ['was', 'were', 'been', 'being', 'is', 'are', 'am']
-    passive_count = sum(1 for word in words if word in passive_indicators)
-    passive_percentage = (passive_count / len(words) * 100) if words else 0
-    
-    return {
-        'sentiment_label': sentiment_label,
-        'sentiment_polarity': round(sentiment.polarity, 2),
-        'sentiment_subjectivity': round(sentiment.subjectivity, 2),
-        'reading_ease': round(reading_ease, 1),
-        'reading_level': reading_level,
-        'reading_grade': round(reading_grade, 1),
-        'formality': formality,
-        'avg_word_length': round(avg_word_length, 1),
-        'passive_voice_percentage': round(passive_percentage, 1)
-    }
 
-def extract_linguistic_features(text, errors):
-    """Extract linguistic features for ML model"""
-    if not text or len(text.strip()) == 0:
-        return np.zeros(12)
-    
-    words = text.split()
-    sentences = re.split(r'[.!?]+', text)
-    sentences = [s.strip() for s in sentences if s.strip()]
-    
-    features = [
-        len(words),
-        len(errors),
-        len(errors) / len(words) if len(words) > 0 else 0,
-        len(sentences),
-        len(words) / len(sentences) if len(sentences) > 0 else 0,
-        sum(1 for w in words if len(w) > 6) / len(words) if len(words) > 0 else 0,
-        sum(1 for w in words if w[0].isupper()) / len(words) if len(words) > 0 else 0,
-        len([c for c in text if c in '.,!?;:']) / len(words) if len(words) > 0 else 0,
-        sum(1 for e in errors if 'spelling' in e['category'].lower()),
-        sum(1 for e in errors if 'grammar' in e['category'].lower()),
-        sum(1 for e in errors if 'punctuation' in e['category'].lower()),
-        1 if any(e['suggestions'] for e in errors) else 0
-    ]
-    
-    return np.array(features)
 
-@st.cache_resource
-def load_ml_model():
-    """Load pre-trained ML model for grammar scoring"""
-    model = RandomForestRegressor(n_estimators=50, random_state=42, max_depth=10)
-    
-    X_train = np.array([
-        [20, 0, 0.0, 2, 10, 0.3, 0.1, 0.15, 0, 0, 0, 0],
-        [15, 1, 0.067, 2, 7.5, 0.2, 0.13, 0.13, 1, 0, 0, 1],
-        [25, 2, 0.08, 3, 8.3, 0.28, 0.12, 0.16, 0, 2, 0, 1],
-        [30, 0, 0.0, 3, 10, 0.35, 0.1, 0.13, 0, 0, 0, 0],
-        [10, 3, 0.3, 1, 10, 0.2, 0.2, 0.1, 1, 2, 0, 1],
-        [18, 1, 0.056, 2, 9, 0.22, 0.11, 0.17, 0, 1, 0, 1],
-        [12, 4, 0.33, 2, 6, 0.17, 0.08, 0.08, 2, 2, 0, 1],
-        [22, 1, 0.045, 3, 7.3, 0.27, 0.14, 0.18, 0, 1, 0, 1],
-        [8, 2, 0.25, 1, 8, 0.13, 0.13, 0.13, 1, 1, 0, 1],
-        [35, 0, 0.0, 4, 8.75, 0.4, 0.11, 0.14, 0, 0, 0, 0],
-        [14, 5, 0.36, 2, 7, 0.14, 0.07, 0.07, 2, 3, 0, 1],
-        [28, 1, 0.036, 3, 9.3, 0.32, 0.11, 0.14, 0, 1, 0, 1],
-        [16, 3, 0.19, 2, 8, 0.19, 0.13, 0.13, 1, 2, 0, 1],
-        [40, 0, 0.0, 5, 8, 0.38, 0.1, 0.15, 0, 0, 0, 0],
-        [11, 6, 0.55, 1, 11, 0.18, 0.09, 0.09, 3, 3, 0, 1],
-        [24, 2, 0.083, 3, 8, 0.25, 0.13, 0.17, 1, 1, 0, 1],
-        [19, 2, 0.11, 2, 9.5, 0.21, 0.11, 0.16, 0, 2, 0, 1],
-        [13, 4, 0.31, 2, 6.5, 0.15, 0.08, 0.08, 2, 2, 0, 1],
-        [32, 1, 0.031, 4, 8, 0.34, 0.13, 0.16, 0, 1, 0, 1],
-        [9, 3, 0.33, 1, 9, 0.11, 0.11, 0.11, 2, 1, 0, 1]
-    ])
-    
-    y_train = np.array([9.5, 8.2, 7.8, 9.8, 5.5, 8.5, 4.2, 8.7, 6.8, 10.0,
-                        3.5, 9.0, 6.5, 10.0, 2.8, 7.5, 7.2, 4.8, 9.2, 6.0])
-    
-    model.fit(X_train, y_train)
-    return model
+
 
 def calculate_grammar_score(text, errors):
-    """Calculate grammar score (0-10) using ML model"""
+    """Calculate grammar score (0-10) based on errors and completeness"""
     if not text or len(text.strip()) == 0:
         return 0.0
     
-    features = extract_linguistic_features(text, errors)
-    model = load_ml_model()
+    # Check if sentence is complete (ends with proper punctuation)
+    text_stripped = text.strip()
+    is_complete = text_stripped.endswith(('.', '!', '?'))
     
-    score = model.predict(features.reshape(1, -1))[0]
+    # Start with base score
+    if len(errors) == 0 and is_complete:
+        return 10.0  # Perfect score for no errors and complete sentence
     
-    score = max(0.0, min(10.0, score))
+    # Base score calculation
+    base_score = 10.0
+    
+    # Reduce score for incomplete sentence
+    if not is_complete:
+        base_score -= 1.0
+    
+    # Reduce score based on number of errors
+    word_count = len(text.split())
+    if word_count > 0:
+        error_penalty = (len(errors) / word_count) * 8  # Max 8 points penalty for errors
+        base_score -= error_penalty
+    
+    # Ensure score is between 0 and 10
+    score = max(0.0, min(10.0, base_score))
     
     return round(score, 1)
 
@@ -316,7 +326,7 @@ def get_score_color(score):
     else:
         return "red"
 
-def display_grammar_feedback(text, errors, score, style_analysis=None):
+def display_grammar_feedback(text, errors, score):
     """Display grammar analysis results"""
     
     # Display score with color
@@ -334,45 +344,6 @@ def display_grammar_feedback(text, errors, score, style_analysis=None):
     # Display transcribed text
     st.subheader("📝 Transcribed Text")
     st.text_area("Your Speech", text, height=150, disabled=True)
-    
-    # Display style and tone analysis
-    if style_analysis:
-        st.subheader("🎨 Style & Tone Analysis")
-        
-        col1, col2, col3, col4 = st.columns(4)
-        with col1:
-            st.metric("Sentiment", style_analysis['sentiment_label'])
-            st.caption(f"Polarity: {style_analysis['sentiment_polarity']}")
-        
-        with col2:
-            st.metric("Formality", style_analysis['formality'])
-            st.caption(f"Avg Word Length: {style_analysis['avg_word_length']}")
-        
-        with col3:
-            st.metric("Reading Level", style_analysis['reading_level'])
-            st.caption(f"Grade: {style_analysis['reading_grade']}")
-        
-        with col4:
-            st.metric("Reading Ease", f"{style_analysis['reading_ease']}")
-            st.caption(f"Passive Voice: {style_analysis['passive_voice_percentage']}%")
-        
-        # Additional insights
-        with st.expander("📖 Detailed Style Insights"):
-            st.write(f"**Sentiment Polarity:** {style_analysis['sentiment_polarity']} (-1 to 1, where -1 is very negative and 1 is very positive)")
-            st.write(f"**Sentiment Subjectivity:** {style_analysis['sentiment_subjectivity']} (0 to 1, where 0 is objective and 1 is subjective)")
-            st.write(f"**Flesch Reading Ease:** {style_analysis['reading_ease']} (Higher scores indicate easier readability)")
-            st.write(f"**Flesch-Kincaid Grade:** {style_analysis['reading_grade']} (U.S. school grade level)")
-            st.write(f"**Average Word Length:** {style_analysis['avg_word_length']} characters")
-            st.write(f"**Passive Voice Usage:** {style_analysis['passive_voice_percentage']}% (Lower is generally better)")
-            
-            # Recommendations
-            st.markdown("**Recommendations:**")
-            if style_analysis['passive_voice_percentage'] > 20:
-                st.info("Consider reducing passive voice usage for more direct and engaging writing.")
-            if style_analysis['reading_ease'] < 60:
-                st.info("Your text is fairly difficult to read. Consider using shorter sentences and simpler words.")
-            if style_analysis['avg_word_length'] > 6:
-                st.info("Try using shorter, more common words to improve clarity.")
     
     # Display errors and suggestions
     if errors:
@@ -407,8 +378,66 @@ def save_audio_file(audio_bytes):
         tmp_file.write(audio_bytes)
         return tmp_file.name
 
+def get_word_meaning(word):
+    """Get word meaning using Gemini API for 5th grade level"""
+    try:
+        model = genai.GenerativeModel('gemini-2.0-flash-exp')
+        prompt = f"Define '{word}' simply for a 5th grader. Give meaning in one sentence, then example in another sentence. Format: Meaning|Example"
+        
+        response = model.generate_content(prompt)
+        text = response.text.strip()
+        
+        # Split meaning and example
+        if '|' in text:
+            parts = text.split('|', 1)
+            meaning = parts[0].strip()
+            example = parts[1].strip()
+        else:
+            # Fallback parsing
+            lines = text.split('\n')
+            meaning = lines[0].strip() if lines else text
+            example = lines[1].strip() if len(lines) > 1 else "Example not available"
+        
+        return meaning, example
+    except Exception as e:
+        return f"Sorry, couldn't find meaning for '{word}'", ""
+
+# Word Meaning Finder - Top Right Only
+if st.session_state.get('show_word_finder', False):
+    # Create top-right positioned container
+    _, _, col_right = st.columns([3, 1, 2])
+    
+    with col_right:
+        with st.container(border=True):
+            # Header with close button
+            header_col1, header_col2 = st.columns([3, 1])
+            with header_col1:
+                st.markdown("**📖 Word Finder**")
+            with header_col2:
+                if st.button("❌", key="close_finder", help="Close"):
+                    st.session_state.show_word_finder = False
+                    st.rerun()
+            
+            # Word input and search
+            word_input = st.text_input("Word:", placeholder="Enter word...", key="word_input", label_visibility="collapsed")
+            
+            if st.button("🔍 Find Meaning", type="primary", key="get_meaning", use_container_width=True):
+                if word_input.strip():
+                    with st.spinner("Searching..."):
+                        meaning, example = get_word_meaning(word_input.strip())
+                        st.markdown(f"**{word_input.title()}:**")
+                        st.write(f"**Meaning:** {meaning}")
+                        if example:
+                            st.write(f"**Example:** {example}")
+                else:
+                    st.warning("Enter a word first!")
+
 # Main app layout
 st.markdown("---")
+
+# Initialize session state
+if 'show_word_finder' not in st.session_state:
+    st.session_state.show_word_finder = False
 
 # Create tabs for different views
 tab1, tab2 = st.tabs(["🎤 Analyze Grammar", "📊 History & Progress"])
@@ -417,56 +446,11 @@ with tab1:
     # Input method selection
     input_method = st.radio(
         "Choose input method:",
-        ["🎙️ Record Audio", "📁 Upload Audio File"],
+        ["📁 Upload Audio File", "🎙️ Record Audio"],
         horizontal=True
     )
 
-    if input_method == "🎙️ Record Audio":
-        st.info("Click the microphone button below to start recording. Speak clearly in English.")
-        
-        audio_bytes = audio_recorder(
-            text="Click to record",
-            recording_color="#e74c3c",
-            neutral_color="#3498db",
-            icon_name="microphone",
-            icon_size="3x"
-        )
-        
-        if audio_bytes:
-            st.audio(audio_bytes, format="audio/wav")
-            
-            if st.button("🔍 Analyze Grammar", type="primary"):
-                with st.spinner("Processing audio and analyzing grammar..."):
-                    # Save audio to temporary file
-                    audio_file_path = save_audio_file(audio_bytes)
-                    
-                    try:
-                        # Transcribe audio
-                        text, error = transcribe_audio(audio_file_path)
-                        
-                        if error:
-                            st.error(error)
-                        elif text:
-                            # Analyze grammar
-                            errors = analyze_grammar(text)
-                            score = calculate_grammar_score(text, errors)
-                            
-                            # Analyze style and tone
-                            style_analysis = analyze_style_and_tone(text)
-                            
-                            # Save to database
-                            save_session_to_db(text, score, errors, "Record Audio")
-                            
-                            # Display results
-                            st.markdown("---")
-                            display_grammar_feedback(text, errors, score, style_analysis)
-                        
-                    finally:
-                        # Clean up temporary file
-                        if os.path.exists(audio_file_path):
-                            os.remove(audio_file_path)
-
-    else:  # Upload Audio File
+    if input_method == "📁 Upload Audio File":
         st.info("Upload an audio file (WAV, MP3, FLAC, etc.) with English speech.")
         
         uploaded_file = st.file_uploader(
@@ -505,70 +489,100 @@ with tab1:
                             errors = analyze_grammar(text)
                             score = calculate_grammar_score(text, errors)
                             
-                            # Analyze style and tone
-                            style_analysis = analyze_style_and_tone(text)
-                            
                             # Save to database
                             save_session_to_db(text, score, errors, "Upload Audio File")
                             
                             # Display results
                             st.markdown("---")
-                            display_grammar_feedback(text, errors, score, style_analysis)
+                            display_grammar_feedback(text, errors, score)
                     
                     finally:
                         # Clean up temporary file
                         if os.path.exists(uploaded_file_path):
                             os.remove(uploaded_file_path)
 
+    else:  # Record Audio
+        st.info("Click the microphone button below to start recording. Speak clearly in English.")
+        
+        audio_bytes = audio_recorder(
+            text="Click to record",
+            recording_color="#e74c3c",
+            neutral_color="#3498db",
+            icon_name="microphone",
+            icon_size="3x"
+        )
+        
+        if audio_bytes:
+            st.audio(audio_bytes, format="audio/wav")
+            
+            if st.button("🔍 Analyze Grammar", type="primary"):
+                with st.spinner("Processing audio and analyzing grammar..."):
+                    # Save audio to temporary file
+                    audio_file_path = save_audio_file(audio_bytes)
+                    
+                    try:
+                        # Transcribe audio
+                        text, error = transcribe_audio(audio_file_path)
+                        
+                        if error:
+                            st.error(error)
+                        elif text:
+                            # Analyze grammar
+                            errors = analyze_grammar(text)
+                            score = calculate_grammar_score(text, errors)
+                            
+                            # Save to database
+                            save_session_to_db(text, score, errors, "Record Audio")
+                            
+                            # Display results
+                            st.markdown("---")
+                            display_grammar_feedback(text, errors, score)
+                        
+                    finally:
+                        # Clean up temporary file
+                        if os.path.exists(audio_file_path):
+                            os.remove(audio_file_path)
+
 with tab2:
     st.header("📊 Your Grammar Progress History")
     st.markdown("Track your grammar improvement over time with detailed session history.")
     
+    # Get user statistics
+    stats = get_user_stats()
     sessions = get_user_history()
     
-    if sessions:
-        # Display summary statistics
-        avg_score = sum(s['score'] for s in sessions) / len(sessions)
-        total_words = sum(s['word_count'] for s in sessions)
-        total_errors = sum(s['error_count'] for s in sessions)
-        
+    if stats:
         col1, col2, col3, col4 = st.columns(4)
         with col1:
-            st.metric("Total Sessions", len(sessions))
+            st.metric("Total Sessions", stats['total_sessions'])
         with col2:
-            st.metric("Average Score", f"{avg_score:.1f}/10")
+            st.metric("Average Score", f"{stats['average_score']}/10")
         with col3:
-            st.metric("Total Words Analyzed", total_words)
+            st.metric("Total Words", stats['total_words'])
         with col4:
-            st.metric("Total Errors Found", total_errors)
+            st.metric("Best Score", f"{stats['best_score']}/10")
+    
+    if sessions:
         
         st.markdown("---")
         st.subheader("Recent Sessions")
         
         # Display each session
-        for session in sessions:
-            with st.expander(
-                f"📅 {session['date'].strftime('%Y-%m-%d %H:%M')} - Score: {session['score']}/10 | "
-                f"Errors: {session['error_count']} | Words: {session['word_count']}"
-            ):
-                st.write(f"**Input Method:** {session['input_method']}")
-                st.write(f"**Transcribed Text:**")
-                st.text_area(
-                    "Text",
-                    session['text'],
-                    height=100,
-                    disabled=True,
-                    key=f"text_{session['id']}"
-                )
+        for i, session in enumerate(sessions):
+            with st.expander(f"📅 Score: {session['score']}/10 | Errors: {session['errors']}"):
+                st.write(f"**Method:** {session['method']}")
+                st.text_area("Text", session['text'], height=80, disabled=True, key=f"text_{i}")
                 
-                # Show errors for this session
+                # Show detailed errors for this session
                 session_errors = get_session_errors(session['id'])
                 if session_errors:
                     st.write(f"**Grammar Errors ({len(session_errors)}):**")
                     for idx, error in enumerate(session_errors, 1):
-                        st.markdown(f"**{idx}.** {error['category']} - {error['message']}")
-                        if error['suggestions']:
-                            st.markdown(f"   *Suggestions:* {', '.join(error['suggestions'])}")
+                        with st.expander(f"Error {idx}: {error['category']}"):
+                            st.write(f"**Message:** {error['message']}")
+                            st.write(f"**Context:** {error['context']}")
+                            if error['suggestions']:
+                                st.write(f"**Suggestions:** {', '.join(error['suggestions'])}")
                 else:
                     st.success("No errors in this session!")
     else:
@@ -602,3 +616,9 @@ with st.sidebar:
     st.markdown("🟢 8-10: Excellent")
     st.markdown("🟡 6-7.9: Good")
     st.markdown("🔴 0-5.9: Needs Improvement")
+    
+    st.markdown("---")
+    st.markdown("**📖 Word Finder:**")
+    st.markdown("Click the button at top-right to find simple word meanings!")
+
+    
